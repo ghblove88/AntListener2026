@@ -1,0 +1,9 @@
+[server]
+url = "http://127.0.0.1:8866/"
+username = "admin"
+password = "password"
+autorun = true
+
+[local]
+port = 9000
+identifier = "A1"
