@@ -68,9 +68,11 @@ Expected deployment files should be placed next to the generated Windows executa
 AntListener 2026.exe
 config.toml
 ding.wav
+bdcg.wav
+bdjc.wav
 ```
 
-`config.toml` and `ding.wav` are intentionally ignored by git for public repositories.
+`config.toml` and `*.wav` are intentionally ignored by git for public repositories.
 Use `config.example.toml` as the template for deployment.
 
 ### GitHub Actions build steps
@@ -159,7 +161,11 @@ The app resolves `config.toml` in this order:
 2. Current working directory.
 3. System app config directory.
 
-`ding.wav` is loaded from the same directory as the resolved `config.toml`.
+Sound files are loaded from the same directory as the resolved `config.toml`:
+
+- `ding.wav`: card data received.
+- `bdcg.wav`: bind succeeded.
+- `bdjc.wav`: unbind succeeded.
 
 Recommended deployment layout:
 
@@ -169,6 +175,8 @@ macOS:
 AntListener 2026.app
 config.toml
 ding.wav
+bdcg.wav
+bdjc.wav
 ```
 
 Windows:
@@ -177,6 +185,8 @@ Windows:
 AntListener 2026.exe
 config.toml
 ding.wav
+bdcg.wav
+bdjc.wav
 ```
 
 ## Field test checklist

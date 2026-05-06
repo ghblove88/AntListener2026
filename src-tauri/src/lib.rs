@@ -338,6 +338,7 @@ async fn handle_client<R: Runtime>(
             client_ip: peer.to_string(),
             command,
         };
+        play_sound(config_path(&app), "ding.wav");
         show_window_for_incoming(&app);
         let _ = app.emit("ant://incoming-command", payload);
     }
@@ -572,6 +573,11 @@ async fn bind_patient<R: Runtime>(
     payload: BindPayload,
 ) -> Result<Value, String> {
     let config = state.config.lock().unwrap().clone();
+    let sound_file = match payload.bindmirrostate.as_str() {
+        "0" => "bdjc.wav",
+        "1" => "bdcg.wav",
+        _ => "ding.wav",
+    };
     let value = api_post(config, "writeback2".to_string(), payload)
         .await
         .map_err(|error| error.to_string())?;
@@ -581,7 +587,7 @@ async fn bind_patient<R: Runtime>(
         .and_then(Value::as_bool)
         .is_some_and(|success| success)
     {
-        play_bind_success_sound(config_path(&app));
+        play_sound(config_path(&app), sound_file);
     }
 
     Ok(value)
@@ -592,6 +598,7 @@ async fn manual_read<R: Runtime>(
     app: AppHandle<R>,
     command: String,
 ) -> Result<(), String> {
+    play_sound(config_path(&app), "ding.wav");
     show_window_for_incoming(&app);
     app.emit(
         "ant://incoming-command",
@@ -621,10 +628,10 @@ fn show_window_for_incoming<R: Runtime>(app: &AppHandle<R>) {
     show_main_window(app);
 }
 
-fn play_bind_success_sound(config_path: PathBuf) {
+fn play_sound(config_path: PathBuf, file_name: &'static str) {
     let Some(path) = config_path
         .parent()
-        .map(|path| path.join("ding.wav"))
+        .map(|path| path.join(file_name))
         .filter(|path| path.exists())
     else {
         return;
