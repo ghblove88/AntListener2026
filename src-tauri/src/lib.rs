@@ -316,7 +316,6 @@ async fn handle_client<R: Runtime>(
     mut stream: tokio::net::TcpStream,
     server_ip: String,
 ) {
-    let mut last_command = String::new();
     loop {
         let mut buffer = [0u8; 1024];
         let len = match stream.read(&mut buffer).await {
@@ -329,10 +328,9 @@ async fn handle_client<R: Runtime>(
         };
 
         let command = parse_command(&buffer[..len]);
-        if command.is_empty() || command == last_command {
+        if command.is_empty() {
             continue;
         }
-        last_command = command.clone();
 
         let payload = IncomingCommand {
             server_ip: server_ip.clone(),
