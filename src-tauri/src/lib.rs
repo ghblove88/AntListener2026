@@ -3,10 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    fs::File,
     fs,
+    io::BufReader,
     net::SocketAddr,
     path::PathBuf,
-    process::Command,
     sync::{Arc, Mutex},
 };
 use tauri::{
@@ -638,21 +639,16 @@ fn play_sound(config_path: PathBuf, file_name: &'static str) {
     };
 
     std::thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = Command::new("afplay").arg(&path).status();
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            let script = format!(
-                "(New-Object Media.SoundPlayer '{}').PlaySync()",
-                path.display().to_string().replace('\'', "''")
-            );
-            let _ = Command::new("powershell")
-                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
-                .status();
-        }
+        let Ok(stream) = rodio::OutputStreamBuilder::open_default_stream() else {
+            return;
+        };
+        let Ok(file) = File::open(&path) else {
+            return;
+        };
+        let Ok(sink) = rodio::play(stream.mixer(), BufReader::new(file)) else {
+            return;
+        };
+        sink.sleep_until_end();
     });
 }
 
