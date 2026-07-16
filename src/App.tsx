@@ -3,29 +3,39 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Ban,
   Check,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   CircleAlert,
   Cog,
+  FileText,
   ListRestart,
   Loader2,
+  MonitorCog,
   Play,
+  Power,
+  RadioTower,
   RefreshCw,
+  Search,
+  Server,
+  ShieldCheck,
   Square,
   Trash2,
   X
 } from "lucide-react";
 import { pinyin } from "pinyin-pro";
-import { useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 type AppConfig = {
   server: {
     url: string;
-    username: string;
-    password: string;
     autorun: boolean;
   };
   local: {
     port: number;
     identifier: string;
+    allowed_ips: string[];
   };
 };
 
@@ -33,6 +43,9 @@ type ListenerStatus = {
   running: boolean;
   port: number;
   device_count: number;
+  active_connections: number;
+  last_error: string | null;
+  log_path: string | null;
 };
 
 type DeviceInfo = {
@@ -103,15 +116,18 @@ type BindDialogState = {
 const defaultConfig: AppConfig = {
   server: {
     url: "http://127.0.0.1:8866/",
-    username: "admin",
-    password: "password",
     autorun: true
   },
   local: {
     port: 9000,
-    identifier: "A1"
+    identifier: "A1",
+    allowed_ips: []
   }
 };
+
+const RECORD_STORAGE_KEY = "ant-listener-2026.records";
+const MAX_LOCAL_RECORDS = 200;
+const RECORD_PAGE_SIZE = 20;
 
 function secToHms(value?: number): string {
   const duration = Number(value || 0);
@@ -146,11 +162,28 @@ function filterPatients(patients: PatientOption[], keyword: string): PatientOpti
   return patients.filter((patient) => searchable(patient).includes(text));
 }
 
+function loadStoredRecords(): BindRecord[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(RECORD_STORAGE_KEY) || "[]");
+    return Array.isArray(value) ? value.slice(0, MAX_LOCAL_RECORDS) : [];
+  } catch {
+    return [];
+  }
+}
+
 function App() {
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
-  const [status, setStatus] = useState<ListenerStatus>({ running: false, port: 9000, device_count: 0 });
-  const [devices, setDevices] = useState<DeviceInfo[]>([]);
-  const [records, setRecords] = useState<BindRecord[]>([]);
+  const [status, setStatus] = useState<ListenerStatus>({
+    running: false,
+    port: 9000,
+    device_count: 0,
+    active_connections: 0,
+    last_error: null,
+    log_path: null
+  });
+  const [records, setRecords] = useState<BindRecord[]>(loadStoredRecords);
+  const [recordKeyword, setRecordKeyword] = useState("");
+  const [recordPage, setRecordPage] = useState(1);
   const [selectedId, setSelectedId] = useState("");
   const [manualNumber, setManualNumber] = useState("");
   const [message, setMessage] = useState("");
@@ -158,6 +191,8 @@ function App() {
   const [showConfig, setShowConfig] = useState(false);
   const [queue, setQueue] = useState<IncomingCommand[]>([]);
   const [dialog, setDialog] = useState<BindDialogState | null>(null);
+  const pendingCommands = useRef(new Set<string>());
+  const dialogRequestId = useRef(0);
 
   async function refreshStatus() {
     const next = await invoke<ListenerStatus>("get_listener_status");
@@ -175,7 +210,6 @@ function App() {
     setMessage("");
     try {
       const list = await invoke<DeviceInfo[]>("refresh_devices");
-      setDevices(list);
       await refreshStatus();
       setMessage(`已刷新 ${list.length} 台内镜设备。`);
     } catch (error) {
@@ -216,14 +250,25 @@ function App() {
   async function saveConfig(next: AppConfig) {
     setBusy(true);
     setMessage("");
+    let saved = false;
     try {
       await invoke("save_config", { config: next });
+      saved = true;
+      const listenerNeedsRestart =
+        status.running &&
+        (config.local.port !== next.local.port ||
+          config.local.allowed_ips.join(",") !== next.local.allowed_ips.join(","));
       setConfig(next);
       setShowConfig(false);
+      if (listenerNeedsRestart) {
+        await invoke("stop_listener");
+        await invoke("start_listener");
+      }
       await refreshStatus();
-      setMessage("配置已保存。端口修改后请重新启动监听。");
+      setMessage(listenerNeedsRestart ? "配置已保存，监听已按新配置重新启动。" : "配置已保存。");
     } catch (error) {
-      setMessage(String(error));
+      await refreshStatus().catch(() => undefined);
+      setMessage(saved ? `配置已保存，但重新启动监听失败：${String(error)}` : String(error));
     } finally {
       setBusy(false);
     }
@@ -235,8 +280,12 @@ function App() {
       setMessage("请输入正确的设备编号。");
       return;
     }
-    await invoke("manual_read", { command });
-    setManualNumber("");
+    try {
+      await invoke("manual_read", { command });
+      setManualNumber("");
+    } catch (error) {
+      setMessage(String(error));
+    }
   }
 
   async function unbindSelected() {
@@ -273,15 +322,20 @@ function App() {
   }
 
   function enqueueIncoming(incoming: IncomingCommand) {
+    if (pendingCommands.current.has(incoming.command)) return;
+    pendingCommands.current.add(incoming.command);
     setQueue((current) => {
-      const exists =
-        dialog?.incoming.command === incoming.command ||
-        current.some((item) => item.command === incoming.command && item.client_ip === incoming.client_ip);
-      return exists ? current : [...current, incoming];
+      if (current.length >= 100) {
+        pendingCommands.current.delete(incoming.command);
+        setMessage("待读取队列已达到 100 条，已拒绝新的刷卡数据。请先处理当前队列。");
+        return current;
+      }
+      return [...current, incoming];
     });
   }
 
   async function openBindDialog(incoming: IncomingCommand) {
+    const requestId = ++dialogRequestId.current;
     setDialog({
       incoming,
       deviceInfo: "",
@@ -292,17 +346,26 @@ function App() {
       saving: false,
       error: ""
     });
-    try {
-      const [deviceInfo, record, patients] = await Promise.all([
+    const [deviceResult, recordResult, patientResult] = await Promise.allSettled([
         invoke<string | null>("get_device_info", { enumber: incoming.command }),
         invoke<AntRecord>("fetch_last_record", { enumber: incoming.command }),
         invoke<PatientOption[]>("fetch_patient_names")
-      ]);
+      ] as const);
+    try {
+      if (recordResult.status === "rejected") throw recordResult.reason;
+      const record = recordResult.value;
       if (record.success === false) {
         throw new Error(record.msg || `未找到内窥镜 ${incoming.command} 的洗消记录。`);
       }
+      if (!record.ant?.Number) {
+        throw new Error(`内窥镜 ${incoming.command} 的洗消记录缺少洗消编号。`);
+      }
+      const deviceInfo = deviceResult.status === "fulfilled" ? deviceResult.value : null;
+      const patients = patientResult.status === "fulfilled" ? patientResult.value : [];
+      const patientError =
+        patientResult.status === "rejected" ? `候诊病人列表读取失败，仍可手动输入姓名：${String(patientResult.reason)}` : "";
       setDialog((current) =>
-        current
+        current && dialogRequestId.current === requestId
           ? {
               ...current,
               deviceInfo: deviceInfo || "",
@@ -310,13 +373,13 @@ function App() {
               patients,
               patientName: patients[0]?.patient_name || "",
               loading: false,
-              error: ""
+              error: patientError
             }
           : current
       );
     } catch (error) {
       setDialog((current) =>
-        current
+        current && dialogRequestId.current === requestId
           ? {
               ...current,
               loading: false,
@@ -328,11 +391,13 @@ function App() {
   }
 
   function closeBindDialog() {
+    dialogRequestId.current += 1;
+    if (dialog) pendingCommands.current.delete(dialog.incoming.command);
     setDialog(null);
   }
 
   async function confirmBind(patientName: string) {
-    if (!dialog?.record?.ant?.Number) return;
+    if (!dialog?.record?.ant?.Number || dialog.saving) return;
     if (!patientName.trim()) {
       setDialog((current) => (current ? { ...current, error: "请输入病人名字，与当前洗消记录绑定。" } : current));
       return;
@@ -363,7 +428,9 @@ function App() {
         totalTime: secToHms(dialog.record.ant.TotalCostTime),
         patientName: patientName.trim()
       };
-      setRecords((current) => [nextRecord, ...current]);
+      setRecords((current) => [nextRecord, ...current].slice(0, MAX_LOCAL_RECORDS));
+      setRecordKeyword("");
+      setRecordPage(1);
       setSelectedId(nextRecord.id);
       closeBindDialog();
     } catch (error) {
@@ -381,19 +448,38 @@ function App() {
 
   useEffect(() => {
     loadConfig().then(refreshStatus).catch((error) => setMessage(String(error)));
+    const statusTimer = window.setInterval(() => {
+      refreshStatus().catch(() => undefined);
+    }, 2000);
+    let disposed = false;
     const unlisteners: Array<() => void> = [];
 
-    listen<IncomingCommand>("ant://incoming-command", (event) => enqueueIncoming(event.payload)).then((unlisten) =>
-      unlisteners.push(unlisten)
-    );
-    listen("ant://open-config", () => setShowConfig(true)).then((unlisten) => unlisteners.push(unlisten));
-    listen("ant://tray-start", () => startListener()).then((unlisten) => unlisteners.push(unlisten));
-    listen("ant://tray-stop", () => stopListener()).then((unlisten) => unlisteners.push(unlisten));
+    function register(unlistenPromise: Promise<() => void>) {
+      unlistenPromise.then((unlisten) => {
+        if (disposed) unlisten();
+        else unlisteners.push(unlisten);
+      });
+    }
+
+    register(listen<IncomingCommand>("ant://incoming-command", (event) => enqueueIncoming(event.payload)));
+    register(listen("ant://open-config", () => setShowConfig(true)));
+    register(listen("ant://tray-start", () => startListener()));
+    register(listen("ant://tray-stop", () => stopListener()));
 
     return () => {
+      disposed = true;
+      window.clearInterval(statusTimer);
       unlisteners.forEach((unlisten) => unlisten());
     };
   }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(RECORD_STORAGE_KEY, JSON.stringify(records.slice(0, MAX_LOCAL_RECORDS)));
+    } catch (error) {
+      setMessage(`本机绑定记录保存失败：${String(error)}`);
+    }
+  }, [records]);
 
   useEffect(() => {
     if (!dialog && queue.length > 0) {
@@ -403,20 +489,73 @@ function App() {
     }
   }, [dialog, queue]);
 
+  const filteredRecords = useMemo(() => {
+    const keyword = recordKeyword.trim().toLowerCase();
+    if (!keyword) return records;
+    return records.filter((record) =>
+      [
+        record.time,
+        record.enumber,
+        record.einfo,
+        record.number,
+        record.operator,
+        record.beginTime,
+        record.patientName
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(keyword)
+    );
+  }, [recordKeyword, records]);
+
+  const recordTotalPages = Math.max(1, Math.ceil(filteredRecords.length / RECORD_PAGE_SIZE));
+  const safeRecordPage = Math.min(recordPage, recordTotalPages);
+  const pageRecords = filteredRecords.slice(
+    (safeRecordPage - 1) * RECORD_PAGE_SIZE,
+    safeRecordPage * RECORD_PAGE_SIZE
+  );
+
+  useEffect(() => {
+    if (recordPage > recordTotalPages) {
+      setRecordPage(recordTotalPages);
+      setSelectedId("");
+    }
+  }, [recordPage, recordTotalPages]);
+
+  function goToRecordPage(page: number) {
+    const nextPage = Math.max(1, Math.min(page, recordTotalPages));
+    setRecordPage(nextPage);
+    setSelectedId("");
+  }
+
   const selectedRecord = records.find((item) => item.id === selectedId);
+  const visibleMessage = status.last_error || message || "";
 
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div>
+        <div className="brand-lockup">
+          <span className="brand-mark" aria-hidden="true">
+            <RadioTower size={21} />
+          </span>
           <h1>AntListener 2026</h1>
-          <p>内镜洗消数据监听与病人绑定</p>
         </div>
         <div className="status-strip">
           <StatusPill active={status.running} label={status.running ? "监听中" : "已停止"} />
-          <span>端口 {status.port}</span>
-          <span>设备 {status.device_count || devices.length}</span>
-          {queue.length > 0 && <span>队列 {queue.length}</span>}
+          <span className="metric-pill metric-port">
+            端口 <strong>{status.port}</strong>
+          </span>
+          <span className="metric-pill metric-device">
+            设备 <strong>{status.device_count}</strong>
+          </span>
+          <span className="metric-pill metric-connection">
+            连接 <strong>{status.active_connections}</strong>
+          </span>
+          {queue.length > 0 && (
+            <span className="metric-pill metric-queue">
+              队列 <strong>{queue.length}</strong>
+            </span>
+          )}
         </div>
       </header>
 
@@ -430,7 +569,7 @@ function App() {
         <button onClick={refreshDevices} disabled={busy}>
           {busy ? <Loader2 className="spin" size={17} /> : <RefreshCw size={17} />} 刷新设备
         </button>
-        <button onClick={() => setShowConfig(true)}>
+        <button className="config-trigger" onClick={() => setShowConfig(true)}>
           <Cog size={17} /> 配置
         </button>
         <div className="manual-read">
@@ -448,22 +587,77 @@ function App() {
         </div>
       </section>
 
-      {message && (
+      {visibleMessage && (
         <div className="message">
           <CircleAlert size={18} />
-          <span>{message}</span>
+          <span>{visibleMessage}</span>
         </div>
       )}
 
       <section className="content-grid">
         <div className="table-panel">
           <div className="panel-header">
-            <h2>绑定记录</h2>
-            <button className="danger" onClick={unbindSelected} disabled={!selectedRecord || busy}>
-              <Ban size={17} /> 解除绑定
-            </button>
+            <div className="panel-heading">
+              <span className="panel-heading-icon" aria-hidden="true">
+                <ListRestart size={18} />
+              </span>
+              <div>
+                <h2>本机绑定记录</h2>
+                <small>仅保留最近 {MAX_LOCAL_RECORDS} 条，可手动清空</small>
+              </div>
+            </div>
+            <div className="panel-actions">
+              <button
+                onClick={() => {
+                  if (!window.confirm("仅清空本机保存的绑定记录，不会解除服务器上的绑定。确定继续吗？")) return;
+                  setRecords([]);
+                  setRecordKeyword("");
+                  setRecordPage(1);
+                  setSelectedId("");
+                }}
+                disabled={records.length === 0 || busy}
+              >
+                <Trash2 size={17} /> 清空记录
+              </button>
+              <button className="danger" onClick={unbindSelected} disabled={!selectedRecord || busy}>
+                <Ban size={17} /> 解除绑定
+              </button>
+            </div>
           </div>
-          <div className="table-wrap">
+          <div className="record-filter-bar">
+            <div className="record-search">
+              <Search size={16} aria-hidden="true" />
+              <input
+                value={recordKeyword}
+                aria-label="搜索本机绑定记录"
+                placeholder="搜索内镜、病人、洗消编号或操作员"
+                onChange={(event) => {
+                  setRecordKeyword(event.target.value);
+                  setRecordPage(1);
+                  setSelectedId("");
+                }}
+              />
+              {recordKeyword && (
+                <button
+                  className="record-search-clear"
+                  aria-label="清除搜索条件"
+                  title="清除搜索"
+                  onClick={() => {
+                    setRecordKeyword("");
+                    setRecordPage(1);
+                    setSelectedId("");
+                  }}
+                >
+                  <X size={14} />
+                </button>
+              )}
+            </div>
+            <span className="record-filter-summary">
+              {recordKeyword ? `筛选 ${filteredRecords.length} / ${records.length} 条` : `共 ${records.length} 条`}
+            </span>
+          </div>
+
+          <div className={pageRecords.length === 0 ? "table-wrap is-empty" : "table-wrap"}>
             <table>
               <thead>
                 <tr>
@@ -478,14 +672,22 @@ function App() {
                 </tr>
               </thead>
               <tbody>
-                {records.length === 0 ? (
+                {pageRecords.length === 0 ? (
                   <tr>
                     <td className="empty" colSpan={8}>
-                      暂无绑定记录。启动监听后，刷卡数据会在这里显示。
+                      <div className="empty-state">
+                        <span aria-hidden="true">
+                          <ListRestart size={22} />
+                        </span>
+                        <strong>{records.length === 0 ? "暂无绑定记录" : "未找到匹配记录"}</strong>
+                        <small>
+                          {records.length === 0 ? "启动监听后，刷卡数据会自动显示在这里" : "请调整或清除搜索条件"}
+                        </small>
+                      </div>
                     </td>
                   </tr>
                 ) : (
-                  records.map((record) => (
+                  pageRecords.map((record) => (
                     <tr
                       key={record.id}
                       className={record.id === selectedId ? "selected" : ""}
@@ -505,21 +707,107 @@ function App() {
               </tbody>
             </table>
           </div>
+
+          <div className="record-pagination">
+            <span>
+              共 <strong>{filteredRecords.length}</strong> 条，每页 {RECORD_PAGE_SIZE} 条
+            </span>
+            <div className="pagination-controls">
+              <button
+                className="page-icon-button"
+                aria-label="第一页"
+                title="第一页"
+                disabled={safeRecordPage <= 1}
+                onClick={() => goToRecordPage(1)}
+              >
+                <ChevronsLeft size={16} />
+              </button>
+              <button disabled={safeRecordPage <= 1} onClick={() => goToRecordPage(safeRecordPage - 1)}>
+                <ChevronLeft size={16} /> 上一页
+              </button>
+              <span className="page-indicator">
+                第 <strong>{safeRecordPage}</strong> / {recordTotalPages} 页
+              </span>
+              <button
+                disabled={safeRecordPage >= recordTotalPages}
+                onClick={() => goToRecordPage(safeRecordPage + 1)}
+              >
+                下一页 <ChevronRight size={16} />
+              </button>
+              <button
+                className="page-icon-button"
+                aria-label="最后一页"
+                title="最后一页"
+                disabled={safeRecordPage >= recordTotalPages}
+                onClick={() => goToRecordPage(recordTotalPages)}
+              >
+                <ChevronsRight size={16} />
+              </button>
+            </div>
+          </div>
         </div>
 
-        <aside className="side-panel">
-          <h2>当前配置</h2>
-          <dl>
-            <dt>服务地址</dt>
-            <dd>{config.server.url}</dd>
-            <dt>本地端口</dt>
-            <dd>{config.local.port}</dd>
-            <dt>本机编号</dt>
-            <dd>{config.local.identifier}</dd>
-            <dt>自动监听</dt>
-            <dd>{config.server.autorun ? "开启" : "关闭"}</dd>
-          </dl>
-          <div className="note">关闭主窗口会隐藏到任务栏托盘。需要完全退出时，请使用托盘菜单中的退出。</div>
+        <aside className="side-panel config-panel">
+          <div className="config-panel-header">
+            <span className="config-panel-mark" aria-hidden="true">
+              <Cog size={19} />
+            </span>
+            <div>
+              <h2>当前配置</h2>
+              <p>运行参数与服务状态</p>
+            </div>
+            <span className={status.running ? "config-health online" : "config-health"}>
+              {status.running ? "运行中" : "已停止"}
+            </span>
+          </div>
+
+          <div className="config-body">
+            <section className="config-group">
+              <h3>服务连接</h3>
+              <ConfigItem icon={<Server size={17} />} label="数据服务地址" value={config.server.url} tone="indigo" mono />
+              <ConfigItem
+                icon={<RadioTower size={17} />}
+                label="本地监听端口"
+                value={`${config.local.port}`}
+                tone="teal"
+                mono
+              />
+            </section>
+
+            <section className="config-group">
+              <h3>终端策略</h3>
+              <ConfigItem icon={<MonitorCog size={17} />} label="本机编号" value={config.local.identifier} tone="blue" />
+              <ConfigItem
+                icon={<Power size={17} />}
+                label="程序启动后"
+                value={config.server.autorun ? "自动启动监听" : "保持监听关闭"}
+                tone={config.server.autorun ? "emerald" : "slate"}
+              />
+              <ConfigItem
+                icon={<ShieldCheck size={17} />}
+                label="允许设备 IP"
+                value={config.local.allowed_ips.length > 0 ? config.local.allowed_ips.join(", ") : "全部内网设备"}
+                tone="amber"
+                mono={config.local.allowed_ips.length > 0}
+              />
+            </section>
+
+            <section className="config-group">
+              <h3>运行诊断</h3>
+              <ConfigItem
+                icon={<FileText size={17} />}
+                label="日志文件"
+                value={status.log_path || "正在初始化"}
+                tone="slate"
+                mono
+              />
+            </section>
+          </div>
+
+          <div className="config-note">
+            <CircleAlert size={16} />
+            <span>关闭主窗口仅隐藏到任务栏托盘；完全退出请使用托盘菜单。</span>
+          </div>
         </aside>
       </section>
 
@@ -545,6 +833,32 @@ function StatusPill({ active, label }: { active: boolean; label: string }) {
   );
 }
 
+function ConfigItem({
+  icon,
+  label,
+  value,
+  tone,
+  mono = false
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  tone: "teal" | "indigo" | "blue" | "emerald" | "amber" | "slate";
+  mono?: boolean;
+}) {
+  return (
+    <div className={`config-item tone-${tone}${mono ? " mono" : ""}`}>
+      <span className="config-item-icon" aria-hidden="true">
+        {icon}
+      </span>
+      <div>
+        <span>{label}</span>
+        <strong title={value}>{value}</strong>
+      </div>
+    </div>
+  );
+}
+
 function ConfigDialog({
   config,
   onCancel,
@@ -555,72 +869,150 @@ function ConfigDialog({
   onSave: (config: AppConfig) => void;
 }) {
   const [draft, setDraft] = useState<AppConfig>(config);
+  const [allowedIps, setAllowedIps] = useState(config.local.allowed_ips.join(", "));
 
   return (
     <div className="modal-backdrop">
       <section className="modal config-modal">
-        <div className="modal-header">
-          <h2>系统配置</h2>
+        <div className="modal-header config-modal-header">
+          <div className="modal-title-block">
+            <span aria-hidden="true">
+              <Cog size={20} />
+            </span>
+            <div>
+              <h2>系统配置</h2>
+              <p>配置数据服务、监听终端与设备访问策略</p>
+            </div>
+          </div>
           <button className="icon-button" onClick={onCancel}>
             <X size={18} />
           </button>
         </div>
-        <label>
-          <span>数据池服务地址</span>
-          <input
-            value={draft.server.url}
-            onChange={(event) => setDraft({ ...draft, server: { ...draft.server, url: event.target.value } })}
-          />
-        </label>
-        <div className="form-row">
-          <label>
-            <span>本地监听端口</span>
-            <input
-              type="number"
-              value={draft.local.port}
-              onChange={(event) =>
-                setDraft({ ...draft, local: { ...draft.local, port: Number(event.target.value || 0) } })
+
+        <div className="config-form">
+          <section className="form-section">
+            <div className="form-section-heading">
+              <span className="tone-indigo" aria-hidden="true">
+                <Server size={18} />
+              </span>
+              <div>
+                <h3>数据服务</h3>
+                <p>病人列表、洗消记录和绑定请求统一使用此地址</p>
+              </div>
+            </div>
+            <label className="field-card">
+              <span className="field-label">数据池服务地址</span>
+              <input
+                type="url"
+                value={draft.server.url}
+                placeholder="例如 http://127.0.0.1:8866/"
+                onChange={(event) => setDraft({ ...draft, server: { ...draft.server, url: event.target.value } })}
+              />
+            </label>
+          </section>
+
+          <section className="form-section">
+            <div className="form-section-heading">
+              <span className="tone-teal" aria-hidden="true">
+                <RadioTower size={18} />
+              </span>
+              <div>
+                <h3>本机监听</h3>
+                <p>设置读卡器接入端口和当前工作站编号</p>
+              </div>
+            </div>
+            <div className="form-row config-field-row">
+              <label className="field-card">
+                <span className="field-label">本地监听端口</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={draft.local.port}
+                  onChange={(event) =>
+                    setDraft({ ...draft, local: { ...draft.local, port: Number(event.target.value || 0) } })
+                  }
+                />
+                <small>有效范围 1–65535</small>
+              </label>
+              <label className="field-card">
+                <span className="field-label">本机编号</span>
+                <input
+                  value={draft.local.identifier}
+                  placeholder="例如 A1"
+                  onChange={(event) => setDraft({ ...draft, local: { ...draft.local, identifier: event.target.value } })}
+                />
+                <small>用于区分医院内不同监听工作站</small>
+              </label>
+            </div>
+
+            <label className="toggle-card">
+              <span className="toggle-icon" aria-hidden="true">
+                <Power size={17} />
+              </span>
+              <span className="toggle-copy">
+                <strong>启动程序后自动监听</strong>
+                <small>开启后无需操作员再次点击“启动监听”</small>
+              </span>
+              <input
+                className="toggle-input"
+                type="checkbox"
+                checked={draft.server.autorun}
+                onChange={(event) => setDraft({ ...draft, server: { ...draft.server, autorun: event.target.checked } })}
+              />
+              <span className="toggle-visual" aria-hidden="true">
+                <i />
+              </span>
+            </label>
+          </section>
+
+          <section className="form-section">
+            <div className="form-section-heading">
+              <span className="tone-amber" aria-hidden="true">
+                <ShieldCheck size={18} />
+              </span>
+              <div>
+                <h3>设备访问策略</h3>
+                <p>限制哪些设备 IP 可以向本机发送刷卡数据</p>
+              </div>
+            </div>
+            <label className="field-card">
+              <span className="field-label">允许连接的设备 IP</span>
+              <input
+                value={allowedIps}
+                placeholder="留空允许全部，例如 192.168.1.20, 192.168.1.21"
+                onChange={(event) => setAllowedIps(event.target.value)}
+              />
+              <small>多个 IP 使用逗号或空格分隔；留空时允许全部内网设备。</small>
+            </label>
+          </section>
+        </div>
+
+        <div className="config-save-bar">
+          <div className="config-restart-note">
+            <RefreshCw size={15} />
+            <span>监听运行时，修改端口或设备 IP 会自动重启监听。</span>
+          </div>
+          <div className="modal-actions config-actions">
+            <button onClick={onCancel}>取消</button>
+            <button
+              className="primary"
+              onClick={() =>
+                onSave({
+                  ...draft,
+                  local: {
+                    ...draft.local,
+                    allowed_ips: allowedIps
+                      .split(/[,，\s]+/)
+                      .map((value) => value.trim())
+                      .filter(Boolean)
+                  }
+                })
               }
-            />
-          </label>
-          <label>
-            <span>本机编号</span>
-            <input
-              value={draft.local.identifier}
-              onChange={(event) => setDraft({ ...draft, local: { ...draft.local, identifier: event.target.value } })}
-            />
-          </label>
-        </div>
-        <div className="form-row">
-          <label>
-            <span>用户名</span>
-            <input
-              value={draft.server.username}
-              onChange={(event) => setDraft({ ...draft, server: { ...draft.server, username: event.target.value } })}
-            />
-          </label>
-          <label>
-            <span>密码</span>
-            <input
-              type="password"
-              value={draft.server.password}
-              onChange={(event) => setDraft({ ...draft, server: { ...draft.server, password: event.target.value } })}
-            />
-          </label>
-        </div>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={draft.server.autorun}
-            onChange={(event) => setDraft({ ...draft, server: { ...draft.server, autorun: event.target.checked } })}
-          />
-          <span>启动程序后自动监听</span>
-        </label>
-        <div className="modal-actions">
-          <button onClick={onCancel}>取消</button>
-          <button className="primary" onClick={() => onSave(draft)}>
-            <Check size={17} /> 保存
-          </button>
+            >
+              <Check size={17} /> 保存配置
+            </button>
+          </div>
         </div>
       </section>
     </div>
@@ -653,7 +1045,7 @@ function BindDialog({
       <section className="modal bind-modal">
         <div className="modal-header">
           <h2>绑定病人姓名</h2>
-          <button className="icon-button" onClick={onCancel}>
+          <button className="icon-button" onClick={onCancel} disabled={state.saving}>
             <X size={18} />
           </button>
         </div>
@@ -786,7 +1178,7 @@ function BindDialog({
         )}
 
         <div className="modal-actions">
-          <button onClick={onCancel}>取消</button>
+          <button onClick={onCancel} disabled={state.saving}>取消</button>
           <button className="primary" onClick={() => onConfirm(state.patientName)} disabled={state.loading || state.saving}>
             {state.saving ? <Loader2 className="spin" size={17} /> : <Check size={17} />} 确定绑定
           </button>

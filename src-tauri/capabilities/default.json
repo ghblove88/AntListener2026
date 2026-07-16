@@ -4,7 +4,6 @@
   "description": "Default permissions for AntListener 2026",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "dialog:default"
+    "core:default"
   ]
 }
