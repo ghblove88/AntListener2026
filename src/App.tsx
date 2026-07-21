@@ -83,6 +83,7 @@ type PatientOption = {
 
 type AntRecord = {
   success?: boolean;
+  code?: string;
   msg?: string;
   ant?: {
     Number?: string;
@@ -171,6 +172,12 @@ function loadStoredRecords(): BindRecord[] {
   }
 }
 
+// 同一内镜一天内可以多次洗消和绑定；这里只按每次唯一的洗消编号去重。
+function hasBoundWashNumber(records: BindRecord[], washNumber: string): boolean {
+  const normalized = washNumber.trim();
+  return normalized !== "" && records.some((item) => item.number.trim() === normalized);
+}
+
 function App() {
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [status, setStatus] = useState<ListenerStatus>({
@@ -191,8 +198,10 @@ function App() {
   const [showConfig, setShowConfig] = useState(false);
   const [queue, setQueue] = useState<IncomingCommand[]>([]);
   const [dialog, setDialog] = useState<BindDialogState | null>(null);
+  const [openingDialog, setOpeningDialog] = useState(false);
   const pendingCommands = useRef(new Set<string>());
   const dialogRequestId = useRef(0);
+  const recordsRef = useRef(records);
 
   async function refreshStatus() {
     const next = await invoke<ListenerStatus>("get_listener_status");
@@ -336,30 +345,37 @@ function App() {
 
   async function openBindDialog(incoming: IncomingCommand) {
     const requestId = ++dialogRequestId.current;
-    setDialog({
-      incoming,
-      deviceInfo: "",
-      record: null,
-      patients: [],
-      patientName: "",
-      loading: true,
-      saving: false,
-      error: ""
-    });
-    const [deviceResult, recordResult, patientResult] = await Promise.allSettled([
-        invoke<string | null>("get_device_info", { enumber: incoming.command }),
-        invoke<AntRecord>("fetch_last_record", { enumber: incoming.command }),
-        invoke<PatientOption[]>("fetch_patient_names")
-      ] as const);
     try {
-      if (recordResult.status === "rejected") throw recordResult.reason;
-      const record = recordResult.value;
+      const record = await invoke<AntRecord>("fetch_last_record", { enumber: incoming.command });
+      if (dialogRequestId.current !== requestId) return;
+      const washNumber = record.ant?.Number?.trim() || "";
+      if (hasBoundWashNumber(recordsRef.current, washNumber)) {
+        pendingCommands.current.delete(incoming.command);
+        setMessage(`已拒绝重复绑定：洗消编号 ${washNumber} 已存在于本机绑定历史。`);
+        return;
+      }
       if (record.success === false) {
         throw new Error(record.msg || `未找到内窥镜 ${incoming.command} 的洗消记录。`);
       }
-      if (!record.ant?.Number) {
+      if (!washNumber) {
         throw new Error(`内窥镜 ${incoming.command} 的洗消记录缺少洗消编号。`);
       }
+
+      setDialog({
+        incoming,
+        deviceInfo: "",
+        record,
+        patients: [],
+        patientName: "",
+        loading: true,
+        saving: false,
+        error: ""
+      });
+      const [deviceResult, patientResult] = await Promise.allSettled([
+        invoke<string | null>("get_device_info", { enumber: incoming.command }),
+        invoke<PatientOption[]>("fetch_patient_names")
+      ] as const);
+      if (dialogRequestId.current !== requestId) return;
       const deviceInfo = deviceResult.status === "fulfilled" ? deviceResult.value : null;
       const patients = patientResult.status === "fulfilled" ? patientResult.value : [];
       const patientError =
@@ -378,15 +394,10 @@ function App() {
           : current
       );
     } catch (error) {
-      setDialog((current) =>
-        current && dialogRequestId.current === requestId
-          ? {
-              ...current,
-              loading: false,
-              error: String(error)
-            }
-          : current
-      );
+      if (dialogRequestId.current !== requestId) return;
+      pendingCommands.current.delete(incoming.command);
+      setDialog(null);
+      setMessage(`无法打开绑定窗口：${String(error)}`);
     }
   }
 
@@ -474,6 +485,7 @@ function App() {
   }, []);
 
   useEffect(() => {
+    recordsRef.current = records;
     try {
       localStorage.setItem(RECORD_STORAGE_KEY, JSON.stringify(records.slice(0, MAX_LOCAL_RECORDS)));
     } catch (error) {
@@ -482,12 +494,13 @@ function App() {
   }, [records]);
 
   useEffect(() => {
-    if (!dialog && queue.length > 0) {
+    if (!dialog && !openingDialog && queue.length > 0) {
       const [next, ...rest] = queue;
       setQueue(rest);
-      openBindDialog(next);
+      setOpeningDialog(true);
+      void openBindDialog(next).finally(() => setOpeningDialog(false));
     }
-  }, [dialog, queue]);
+  }, [dialog, openingDialog, queue]);
 
   const filteredRecords = useMemo(() => {
     const keyword = recordKeyword.trim().toLowerCase();
@@ -602,14 +615,14 @@ function App() {
                 <ListRestart size={18} />
               </span>
               <div>
-                <h2>本机绑定记录</h2>
-                <small>仅保留最近 {MAX_LOCAL_RECORDS} 条，可手动清空</small>
+                <h2>本机绑定历史</h2>
+                <small>仅展示绑定成功并经服务端复核的最近 {MAX_LOCAL_RECORDS} 条历史</small>
               </div>
             </div>
             <div className="panel-actions">
               <button
                 onClick={() => {
-                  if (!window.confirm("仅清空本机保存的绑定记录，不会解除服务器上的绑定。确定继续吗？")) return;
+                  if (!window.confirm("仅清空本机保存的绑定历史，不会解除服务器上的绑定。确定继续吗？")) return;
                   setRecords([]);
                   setRecordKeyword("");
                   setRecordPage(1);
@@ -617,7 +630,7 @@ function App() {
                 }}
                 disabled={records.length === 0 || busy}
               >
-                <Trash2 size={17} /> 清空记录
+                <Trash2 size={17} /> 清空历史
               </button>
               <button className="danger" onClick={unbindSelected} disabled={!selectedRecord || busy}>
                 <Ban size={17} /> 解除绑定
@@ -629,7 +642,7 @@ function App() {
               <Search size={16} aria-hidden="true" />
               <input
                 value={recordKeyword}
-                aria-label="搜索本机绑定记录"
+                aria-label="搜索本机绑定历史"
                 placeholder="搜索内镜、病人、洗消编号或操作员"
                 onChange={(event) => {
                   setRecordKeyword(event.target.value);
@@ -679,9 +692,9 @@ function App() {
                         <span aria-hidden="true">
                           <ListRestart size={22} />
                         </span>
-                        <strong>{records.length === 0 ? "暂无绑定记录" : "未找到匹配记录"}</strong>
+                        <strong>{records.length === 0 ? "暂无绑定历史" : "未找到匹配记录"}</strong>
                         <small>
-                          {records.length === 0 ? "启动监听后，刷卡数据会自动显示在这里" : "请调整或清除搜索条件"}
+                          {records.length === 0 ? "绑定成功并经服务端状态复核后，历史记录会显示在这里" : "请调整或清除搜索条件"}
                         </small>
                       </div>
                     </td>

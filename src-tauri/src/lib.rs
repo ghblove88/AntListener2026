@@ -332,6 +332,45 @@ async fn api_post<T: Serialize>(state: &AppState, resource: &str, body: T) -> Re
         .context("数据池服务返回的 JSON 无效")
 }
 
+fn verify_binding_state(
+    value: &Value,
+    expected_number: &str,
+    expected_patient: &str,
+) -> Result<()> {
+    if value.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!("服务端未返回本次洗消记录"));
+    }
+    let ant = value
+        .get("ant")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("服务端复核响应缺少洗消记录"))?;
+    let actual_number = ant
+        .get("number")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let actual_patient = ant
+        .get("patient")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if actual_number != expected_number.trim() {
+        return Err(anyhow!(
+            "服务端复核洗消编号不一致，期望 {}，实际 {}",
+            expected_number,
+            actual_number
+        ));
+    }
+    if actual_patient != expected_patient.trim() {
+        return Err(anyhow!(
+            "服务端复核病人姓名不一致，期望 {}，实际 {}",
+            expected_patient,
+            actual_patient
+        ));
+    }
+    Ok(())
+}
+
 async fn load_devices_into_state(state: &AppState) -> Result<Vec<DeviceInfo>> {
     let value = api_get(state, "device").await?;
     let devices = value
@@ -820,6 +859,9 @@ async fn bind_patient<R: Runtime>(
     state: State<'_, AppState>,
     payload: BindPayload,
 ) -> Result<Value, String> {
+    let verify_binding = payload.bindmirrostate == "1";
+    let expected_number = payload.number.clone();
+    let expected_patient = payload.namepatient.clone();
     let sound_file = match payload.bindmirrostate.as_str() {
         "0" => "bdjc.wav",
         "1" => "bdcg.wav",
@@ -834,6 +876,24 @@ async fn bind_patient<R: Runtime>(
         .and_then(Value::as_bool)
         .is_some_and(|success| success)
     {
+        if verify_binding {
+            let verification = api_get(&state, &format!("data/v1/recordByNo/{expected_number}"))
+                .await
+                .map_err(|error| {
+                    record_error(
+                        &state,
+                        format!("绑定接口成功，但服务端状态复核请求失败: {error}"),
+                    )
+                })?;
+            verify_binding_state(&verification, &expected_number, &expected_patient).map_err(
+                |error| {
+                    record_error(
+                        &state,
+                        format!("绑定接口成功，但服务端状态复核失败: {error}"),
+                    )
+                },
+            )?;
+        }
         clear_error(&state);
         play_sound(config_path(&app), sound_file);
     } else if let Some(message) = value.get("msg").and_then(Value::as_str) {
@@ -1065,7 +1125,26 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_command, validate_config, AppConfig, PacketDecoder};
+    use super::{parse_command, validate_config, verify_binding_state, AppConfig, PacketDecoder};
+    use serde_json::json;
+
+    #[test]
+    fn binding_verification_requires_matching_bound_record() {
+        let response = json!({
+            "success": true,
+            "ant": {"number": "ANT001", "patient": "张三"}
+        });
+        verify_binding_state(&response, "ANT001", "张三").unwrap();
+    }
+
+    #[test]
+    fn binding_verification_rejects_mismatched_record() {
+        let response = json!({
+            "success": true,
+            "ant": {"number": "ANT000", "patient": "李四"}
+        });
+        assert!(verify_binding_state(&response, "ANT001", "张三").is_err());
+    }
 
     #[test]
     fn parses_legacy_ten_byte_card_number() {

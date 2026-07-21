@@ -21,9 +21,10 @@ Tauri rewrite of the original WinForms AntListener.
 - Last washing record lookup from `GET /lastrecordbyeid/{enumber}`.
 - Patient list lookup from `POST /getPatientNameList`.
 - Chinese name filtering and pinyin initial filtering.
-- Bind/unbind through `POST /writeback2`.
+- Bind/unbind through `POST /writeback2`; a successful bind is accepted only after `/data/v1/recordByNo/{number}` confirms the exact washing number and patient name.
 - Manual device-number read.
-- The latest 200 local binding records survive restarts and can be cleared from the UI.
+- The latest 200 locally verified binding-history entries survive restarts and can be cleared from the UI. They are history, not currently bindable washing records.
+- Duplicate protection is keyed by washing-record number, not endoscope number, so the same endoscope can be washed and bound again normally later the same day.
 - Runtime errors are written to `ant-listener.log` in the operating system app log directory.
 
 ## Development
