@@ -345,14 +345,17 @@ fn verify_binding_state(
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("服务端复核响应缺少洗消记录"))?;
     let actual_number = ant
-        .get("number")
+        .get("Number")
+        .or_else(|| ant.get("number"))
         .and_then(Value::as_str)
-        .unwrap_or_default()
+        .ok_or_else(|| anyhow!("服务端复核响应缺少洗消编号字段 Number/number"))?
         .trim();
     let actual_patient = ant
-        .get("patient")
+        .get("PatientName")
+        .or_else(|| ant.get("patient"))
+        .or_else(|| ant.get("patient_name"))
         .and_then(Value::as_str)
-        .unwrap_or_default()
+        .ok_or_else(|| anyhow!("服务端复核响应缺少病人姓名字段 PatientName/patient"))?
         .trim();
     if actual_number != expected_number.trim() {
         return Err(anyhow!(
@@ -1129,7 +1132,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn binding_verification_requires_matching_bound_record() {
+    fn binding_verification_accepts_real_uppercase_api_fields() {
+        let response = json!({
+            "success": true,
+            "ant": {"Number": "ANT2026000001", "PatientName": "覃道淑"}
+        });
+        verify_binding_state(&response, "ANT2026000001", "覃道淑").unwrap();
+    }
+
+    #[test]
+    fn binding_verification_accepts_lowercase_compatibility_fields() {
         let response = json!({
             "success": true,
             "ant": {"number": "ANT001", "patient": "张三"}
@@ -1144,6 +1156,16 @@ mod tests {
             "ant": {"number": "ANT000", "patient": "李四"}
         });
         assert!(verify_binding_state(&response, "ANT001", "张三").is_err());
+    }
+
+    #[test]
+    fn binding_verification_reports_missing_number_field() {
+        let response = json!({
+            "success": true,
+            "ant": {"PatientName": "张三"}
+        });
+        let error = verify_binding_state(&response, "ANT001", "张三").unwrap_err();
+        assert!(error.to_string().contains("Number/number"));
     }
 
     #[test]
